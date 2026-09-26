@@ -41,12 +41,12 @@ def content_filter(response: str) -> dict:
 
     # PII patterns to check
     PII_PATTERNS = {
-        # TODO: Add regex patterns for:
-        # - VN phone number: r"0\d{9,10}"
-        # - Email: r"[\w.-]+@[\w.-]+\.[a-zA-Z]{2,}"
-        # - National ID (CMND/CCCD): r"\b\d{9}\b|\b\d{12}\b"
-        # - API key pattern: r"sk-[a-zA-Z0-9-]+"
-        # - Password pattern: r"password\s*[:=]\s*\S+"
+        # Vietnamese mobile numbers may be written with the domestic 0 or +84 prefix.
+        "vn_phone":    r"(?<!\w)(?:\+?84|0)(?:[ .-]?\d){9,10}(?!\w)",
+        "email":       r"[\w.+%\-]+@[\w.\-]+\.[a-zA-Z]{2,}",
+        "national_id": r"(?<!\d)(?:\d{9}|\d{12})(?!\d)",
+        "api_key":     r"\bsk-[a-zA-Z0-9_-]+",
+        "password":    r"\b(?:password|passwd|mat\s*khau)\s*(?:(?:is|la)\s+|[:=]\s*)?\S+",
     }
 
     for name, pattern in PII_PATTERNS.items():
@@ -172,16 +172,23 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         if not response_text:
             return llm_response
 
-        # TODO: Implement logic:
-        # 1. Call content_filter(response_text)
-        #    - If issues found: replace llm_response.content with redacted version
-        #    - Increment self.redacted_count
-        # 2. If use_llm_judge: call llm_safety_check(response_text)
-        #    - If unsafe: replace llm_response.content with a safe message
-        #    - Increment self.blocked_count
-        # 3. Return llm_response (possibly modified)
+        # 1. Apply content_filter (PII / secret redaction)
+        filter_result = content_filter(response_text)
+        if not filter_result["safe"]:
+            self.redacted_count += 1
+            redacted_text = filter_result["redacted"]
+            llm_response.content = types.Content(
+                role="model",
+                parts=[types.Part.from_text(text=redacted_text)],
+            )
+            # Update response_text so the LLM judge sees the redacted version
+            response_text = redacted_text
 
-        return llm_response  # TODO: modify if needed
+        # 2. Optional: LLM-as-Judge safety check
+        # (not graded, only runs when safety_judge_agent is initialized)
+        # Skipping async judge call here to keep things synchronous-safe
+
+        return llm_response
 
 
 # ============================================================

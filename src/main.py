@@ -19,6 +19,11 @@ import asyncio
 import sys
 from pathlib import Path
 
+# Keep the documented CLI usable on Windows consoles whose legacy code page
+# cannot print the Unicode arrows/characters used in status messages.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+
 # Cho phép chạy ``python src/main.py`` từ gốc repo
 _SRC_DIR = Path(__file__).resolve().parent
 if str(_SRC_DIR) not in sys.path:
@@ -134,10 +139,13 @@ async def part4_attacks():
 
 
 async def main(parts=None):
-    setup_api_key()
-
     if parts is None:
         parts = [2, 3, 4]  # Core: CP2 → CP3 → CP4
+
+    # Checkpoints 2–3 run local guardrail/pipeline demonstrations and do not
+    # call a model provider. Only Checkpoint 4 needs provider credentials.
+    if 4 in parts:
+        setup_api_key()
 
     for part in parts:
         if part == 2:

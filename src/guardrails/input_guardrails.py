@@ -10,7 +10,9 @@ Status convention (không dùng True/False mơ hồ):
 """
 from __future__ import annotations
 
+import html
 import re
+import unicodedata
 from typing import Literal
 
 from google.genai import types
@@ -43,23 +45,317 @@ InputStatus = Literal["ALLOW", "BLOCK"]
 # ============================================================
 
 def detect_injection(user_input: str) -> InputStatus:
-    """Detect prompt injection patterns in user input.
+    """
+    Detect jailbreak / prompt injection patterns.
 
     Args:
-        user_input: The user's message
+        user_input: The user's message.
 
     Returns:
-        ``"BLOCK"`` if injection detected (chặn), ``"ALLOW"`` otherwise (cho qua).
+        "BLOCK" if likely prompt injection is detected,
+        otherwise "ALLOW".
     """
-    INJECTION_PATTERNS = [
-        # TODO: Add at least 5 regex patterns
-        # Example:
-        # r"ignore (all )?(previous|above) instructions",
+
+    def normalize_text(text: str) -> str:
+        # Decode HTML entities:
+        # &#105;gnore -> ignore
+        text = html.unescape(text)
+
+        # Decode Unicode Tags U+E0020..U+E007E.
+        # These characters can hide ASCII text visually.
+        decoded = []
+
+        for char in text:
+            code = ord(char)
+
+            if 0xE0020 <= code <= 0xE007E:
+                decoded.append(chr(code - 0xE0000))
+            elif code in (0xE0001, 0xE007F):
+                continue
+            else:
+                decoded.append(char)
+
+        text = "".join(decoded)
+
+        # Normalize compatibility Unicode:
+        # ｉｇｎｏｒｅ -> ignore
+        text = unicodedata.normalize("NFKC", text)
+
+        cleaned = []
+
+        for char in text:
+            category = unicodedata.category(char)
+            code = ord(char)
+
+            # Preserve normal whitespace.
+            if char.isspace():
+                cleaned.append(" ")
+                continue
+
+            # Remove hidden/control Unicode from the detection copy.
+            # Includes many zero-width and bidi-control characters.
+            if category in {"Cf", "Cc", "Cs"}:
+                continue
+
+            # Remove variation selectors.
+            if (
+                0xFE00 <= code <= 0xFE0F
+                or 0xE0100 <= code <= 0xE01EF
+            ):
+                continue
+
+            cleaned.append(char)
+
+        text = "".join(cleaned)
+
+        # Case-insensitive Unicode normalization.
+        text = text.casefold()
+
+        # Remove accents for easier Vietnamese detection.
+        text = unicodedata.normalize("NFKD", text)
+        text = "".join(
+            char
+            for char in text
+            if unicodedata.category(char) != "Mn"
+        )
+
+        text = text.replace("đ", "d")
+
+        # Detect simple obfuscation:
+        # i g n o r e
+        # i.g.n.o.r.e
+        # i-g-n-o-r-e
+        text = re.sub(
+            r"(?<![a-z])(?:[a-z][\s._-]+){3,}[a-z](?![a-z])",
+            lambda match: re.sub(
+                r"[\s._-]+",
+                "",
+                match.group(0),
+            ),
+            text,
+        )
+
+        # Normalize repeated whitespace.
+        text = re.sub(r"\s+", " ", text)
+
+        return text.strip()
+
+    text = normalize_text(user_input)
+
+    # Each rule has a weight.
+    #
+    # Weak patterns alone should NOT immediately block because
+    # benign messages may discuss prompt injection academically.
+    injection_patterns = [
+        # High confidence: a direct request to ignore the prior instruction set.
+        # Keep this specific so explanatory/educational text is less likely to
+        # be blocked by the broader weighted signals below.
+        (
+            4,
+            r"\b(?:ignore|disregard|forget|override)\s+(?:all\s+)?(?:the\s+)?"
+            r"(?:previous|prior|above|earlier)\s+(?:system\s+)?"
+            r"(?:instructions?|prompts?|rules?)\b",
+        ),
+        # -----------------------------------------------------
+        # Ignore / override previous instructions
+        # -----------------------------------------------------
+        (
+            2,
+            r"""
+            \b(?:ignore|disregard|forget|discard|override|supersede)\b
+            .{0,80}?
+            (?:
+                \b(?:previous|prior|above|earlier|system|developer)\b
+                .{0,50}?
+                \b(?:instruction(?:s)?|prompt(?:s)?|rule(?:s)?|message(?:s)?|policy|policies)\b
+
+                |
+
+                \b(?:instruction(?:s)?|prompt(?:s)?|rule(?:s)?|message(?:s)?|policy|policies)\b
+                .{0,50}?
+                \b(?:previous|prior|above|earlier|system|developer)\b
+            )
+            """,
+        ),
+
+        # -----------------------------------------------------
+        # Override previous instructions AND issue a new command
+        # -----------------------------------------------------
+        (
+            3,
+            r"""
+            \b(?:ignore|disregard|forget|discard|override)\b
+            .{0,100}?
+            \b(?:instruction(?:s)?|prompt(?:s)?|rule(?:s)?|message(?:s)?)\b
+            .{0,80}?
+            \b(?:instead|now|then|do|say|answer|execute|follow|obey)\b
+            """,
+        ),
+
+        # -----------------------------------------------------
+        # Extract system/developer/hidden prompt
+        # -----------------------------------------------------
+        (
+            4,
+            r"""
+            \b(?:reveal|show|print|display|expose|leak|dump|output|repeat)\b
+            .{0,60}?
+            \b(?:system|developer|hidden|internal|initial)\b
+            .{0,40}?
+            \b(?:prompt|instruction(?:s)?|message(?:s)?|rule(?:s)?)\b
+            """,
+        ),
+
+        # Alternative ordering:
+        # "system prompt, print it"
+        (
+            4,
+            r"""
+            \b(?:system|developer|hidden|internal)\b
+            .{0,30}?
+            \b(?:prompt|instruction(?:s)?|message(?:s)?)\b
+            .{0,50}?
+            \b(?:reveal|show|print|display|expose|leak|dump|output|repeat)\b
+            """,
+        ),
+
+        # -----------------------------------------------------
+        # Safety / guardrail bypass
+        # -----------------------------------------------------
+        (
+            3,
+            r"""
+            \b(?:bypass|disable|evade|circumvent|remove|turn\s+off)\b
+            .{0,50}?
+            \b(?:safety|guardrail(?:s)?|filter(?:s)?|moderation|
+                restriction(?:s)?|policy|policies|alignment)\b
+            """,
+        ),
+
+        # -----------------------------------------------------
+        # Typical jailbreak persona attacks
+        # -----------------------------------------------------
+        (
+            4,
+            r"""
+            \b(?:you\s+are\s+now|act\s+as|pretend\s+(?:you\s+are|to\s+be)|
+                switch\s+to|enter)\b
+            .{0,50}?
+            \b(?:dan|developer\s+mode|jailbreak(?:\s+mode)?|
+                unrestricted|unfiltered|no[-\s]?rules?|god\s+mode)\b
+            """,
+        ),
+
+        # -----------------------------------------------------
+        # Fake system/developer role injection
+        # -----------------------------------------------------
+        (
+            3,
+            r"""
+            (?:^|\s)
+            (?:system|developer)
+            \s*:\s*
+            (?:ignore|override|reveal|execute|follow|obey)
+            \b
+            """,
+        ),
+
+        # -----------------------------------------------------
+        # Attempt to alter instruction hierarchy
+        # -----------------------------------------------------
+        (
+            3,
+            r"""
+            \b(?:system|developer)
+            \s+(?:prompt|message|instruction(?:s)?)\b
+            .{0,70}?
+            \b(?:override|replace|supersede|ignore|
+                higher\s+priority|lower\s+priority)\b
+            """,
+        ),
+
+        # =====================================================
+        # Vietnamese
+        # normalize_text() removes Vietnamese accents.
+        # =====================================================
+
+        # bỏ qua / phớt lờ chỉ dẫn trước đó
+        (
+            2,
+            r"""
+            \b(?:bo\s+qua|phot\s+lo|quen|ghi\s+de|vo\s+hieu\s+hoa)\b
+            .{0,80}?
+            \b(?:chi\s+dan|huong\s+dan|lenh|prompt|
+                quy\s+tac|chinh\s+sach)\b
+            .{0,60}?
+            \b(?:truoc|truoc\s+do|o\s+tren|he\s+thong|developer)\b
+            """,
+        ),
+
+        # bỏ chỉ dẫn rồi đưa lệnh mới
+        (
+            3,
+            r"""
+            \b(?:bo\s+qua|phot\s+lo|quen|ghi\s+de)\b
+            .{0,100}?
+            \b(?:chi\s+dan|huong\s+dan|lenh|prompt|quy\s+tac)\b
+            .{0,80}?
+            \b(?:bay\s+gio|thay\s+vao\s+do|sau\s+do|
+                hay|lam|tra\s+loi|thuc\s+hien|tuan\s+theo)\b
+            """,
+        ),
+
+        # tiết lộ system prompt
+        (
+            4,
+            r"""
+            \b(?:tiet\s+lo|hien\s+thi|in\s+ra|lap\s+lai|
+                cho\s+toi\s+xem)\b
+            .{0,60}?
+            \b(?:system\s+prompt|developer\s+prompt|
+                prompt\s+he\s+thong|chi\s+dan\s+he\s+thong|
+                lenh\s+he\s+thong)\b
+            """,
+        ),
+
+        # bypass guardrail in Vietnamese
+        (
+            3,
+            r"""
+            \b(?:bo\s+qua|vo\s+hieu\s+hoa|lach|vuot\s+qua|tat)\b
+            .{0,50}?
+            \b(?:guardrail(?:s)?|bo\s+loc|kiem\s+duyet|
+                chinh\s+sach|han\s+che|co\s+che\s+an\s+toan)\b
+            """,
+        ),
+
+        # Vietnamese role hijacking
+        (
+            4,
+            r"""
+            \b(?:bay\s+gio\s+ban\s+la|dong\s+vai|
+                gia\s+vo|chuyen\s+sang\s+che\s+do)\b
+            .{0,50}?
+            \b(?:dan|developer|jailbreak|
+                khong\s+kiem\s+duyet|khong\s+gioi\s+han)\b
+            """,
+        ),
     ]
 
-    for pattern in INJECTION_PATTERNS:
-        if re.search(pattern, user_input, re.IGNORECASE):
+    score = 0
+
+    for weight, pattern in injection_patterns:
+        if re.search(
+            pattern,
+            text,
+            flags=re.IGNORECASE | re.DOTALL | re.VERBOSE,
+        ):
+            score += weight
+
+        # High-confidence threshold.
+        if score >= 4:
             return "BLOCK"
+
     return "ALLOW"
 
 
@@ -84,14 +380,27 @@ def topic_filter(user_input: str) -> InputStatus:
         ``"BLOCK"`` = chặn (off-topic hoặc topic cấm).
         ``"ALLOW"`` = cho qua (câu banking hợp lệ).
     """
-    input_lower = user_input.lower()
+    def normalize_topic(text: str) -> str:
+        text = unicodedata.normalize("NFKD", text.casefold())
+        text = "".join(
+            char for char in text if unicodedata.category(char) != "Mn"
+        ).replace("đ", "d")
+        return re.sub(r"[^\w]+", " ", text).strip()
 
-    # TODO: Implement logic:
-    # 1. If input contains any blocked topic -> return "BLOCK"
-    # 2. If input doesn't contain any allowed topic -> return "BLOCK"
-    # 3. Otherwise -> return "ALLOW"
+    input_lower = f" {normalize_topic(user_input)} "
 
-    pass  # Replace with your implementation
+    # Check explicitly blocked topics first
+    for blocked in BLOCKED_TOPICS:
+        if f" {normalize_topic(blocked)} " in input_lower:
+            return "BLOCK"
+
+    # Check if any allowed topic keyword is present
+    for allowed in ALLOWED_TOPICS:
+        if f" {normalize_topic(allowed)} " in input_lower:
+            return "ALLOW"
+
+    # Default: off-topic if no banking keyword found
+    return "BLOCK"
 
 
 # ============================================================
@@ -144,14 +453,24 @@ class InputGuardrailPlugin(base_plugin.BasePlugin):
         self.total_count += 1
         text = self._extract_text(user_message)
 
-        # TODO: Implement logic:
-        # 1. Call detect_injection(text)
-        #    - If "BLOCK": increment blocked_count, return self._block_response("...")
-        # 2. Call topic_filter(text)
-        #    - If "BLOCK": increment blocked_count, return self._block_response("...")
-        # 3. If both return "ALLOW": return None (let message through)
+        # 1. Check for prompt injection
+        if detect_injection(text) == "BLOCK":
+            self.blocked_count += 1
+            return self._block_response(
+                "Yêu cầu của bạn đã bị chặn vì phát hiện dấu hiệu tấn công prompt injection. "
+                "Vui lòng đặt câu hỏi liên quan đến dịch vụ ngân hàng."
+            )
 
-        pass  # Replace with your implementation
+        # 2. Check for off-topic content
+        if topic_filter(text) == "BLOCK":
+            self.blocked_count += 1
+            return self._block_response(
+                "Tôi chỉ có thể hỗ trợ các câu hỏi liên quan đến dịch vụ ngân hàng VinBank. "
+                "Vui lòng đặt câu hỏi về tài khoản, giao dịch, tiết kiệm, vay vốn, v.v."
+            )
+
+        # 3. Both checks passed — let message through
+        return None
 
 
 # ============================================================
